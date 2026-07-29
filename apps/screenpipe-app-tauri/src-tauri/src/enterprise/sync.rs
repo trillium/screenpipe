@@ -224,6 +224,11 @@ pub struct Cursor {
     /// before memory sync was added.
     #[serde(default)]
     pub last_memory_ts: Option<String>,
+    /// ISO-8601 UTC. Latest parsed frame projection uploaded. Kept separate
+    /// from the frame cursor so enabling this default-off stream can safely
+    /// backfill its own bounded window.
+    #[serde(default)]
+    pub last_parsed_ts: Option<String>,
 }
 
 impl Cursor {
@@ -326,6 +331,16 @@ pub trait LocalApiClient: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Fetch app-specific semantic projections since `since_ts`, ordered ASC.
+    /// Default empty keeps older local clients compatible.
+    async fn fetch_parsed_since(
+        &self,
+        _since_ts: Option<&str>,
+        _limit: u32,
+    ) -> Result<Vec<ParsedRow>, EnterpriseSyncError> {
+        Ok(Vec::new())
+    }
+
     /// Fetch one frame's full-resolution JPEG by id — the same image the
     /// local `/frames/{id}` route serves, which means capture-time PII
     /// redaction has already been applied when the org policy enables it.
@@ -347,7 +362,7 @@ pub trait LocalApiClient: Send + Sync {
 // same types — so it lives in `screenpipe-telemetry-wire`. Re-exported here
 // so the desktop shim keeps importing everything from `ee_sync::`.
 pub use screenpipe_telemetry_wire::{
-    AudioRow, FrameRow, MemoryRow, SnapshotRow, TelemetryRecord, UiEventRow,
+    AudioRow, FrameRow, MemoryRow, ParsedRow, SnapshotRow, TelemetryRecord, UiEventRow,
 };
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
@@ -406,7 +421,7 @@ pub fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
 
 // `build_jsonl` moved to the wire crate with the record types (the gateway
 // uses it to synthesize test fixtures byte-identical to real batches).
-pub use screenpipe_telemetry_wire::build_jsonl;
+pub use screenpipe_telemetry_wire::{build_jsonl, build_jsonl_with_parsed};
 
 /// Split JSONL on record boundaries for hosted ingest. Concatenating the
 /// returned chunks always reproduces `body` byte-for-byte; no record is
@@ -518,6 +533,10 @@ pub async fn run_one_sync(
         let cutoff = chrono::Utc::now() - chrono::Duration::from_std(SAFE_BACKFILL).unwrap();
         cursor.last_memory_ts = Some(cutoff.to_rfc3339());
     }
+    if cursor.last_parsed_ts.is_none() {
+        let cutoff = chrono::Utc::now() - chrono::Duration::from_std(SAFE_BACKFILL).unwrap();
+        cursor.last_parsed_ts = Some(cutoff.to_rfc3339());
+    }
 
     // Per-stream sync policy is fetched fresh on every tick — the admin can
     // flip toggles in the dashboard and the device picks them up on the next
@@ -589,21 +608,40 @@ pub async fn run_one_sync(
     } else {
         Vec::new()
     };
+    // Parsed app data is a separate privacy-sensitive stream. It is best
+    // effort because parser support is optional and older local servers do
+    // not expose content_type=parsed.
+    let parsed = if streams.parsed {
+        match local
+            .fetch_parsed_since(cursor.last_parsed_ts.as_deref(), PAGE_LIMIT)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!("enterprise sync: parsed fetch failed (skipping): {}", e);
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
 
     if frames.is_empty()
         && audio.is_empty()
         && ui.is_empty()
         && snapshots.is_empty()
         && memories.is_empty()
+        && parsed.is_empty()
     {
         debug!("enterprise sync: nothing new since last tick");
         return Ok(SyncTickReport::default());
     }
 
-    let body = build_jsonl(
+    let body = build_jsonl_with_parsed(
         &cfg.device_id,
         &cfg.device_label,
         &frames,
+        &parsed,
         &audio,
         &ui,
         &snapshots,
@@ -624,6 +662,9 @@ pub async fn run_one_sync(
     if let Some(latest) = memories.last() {
         next_cursor.last_memory_ts = Some(latest.created_at.clone());
     }
+    if let Some(latest) = parsed.last() {
+        next_cursor.last_parsed_ts = Some(latest.timestamp.clone());
+    }
 
     match &cfg.upload_mode {
         EnterpriseUploadMode::HostedIngest => {
@@ -634,6 +675,7 @@ pub async fn run_one_sync(
         EnterpriseUploadMode::DirectWriteOnly(direct) => {
             let counts = DirectUploadRecordCounts {
                 frames: frames.len(),
+                parsed: parsed.len(),
                 audio: audio.len(),
                 ui: ui.len(),
                 snapshots: snapshots.len(),
@@ -652,6 +694,7 @@ pub async fn run_one_sync(
         EnterpriseUploadMode::DirectReadable(direct) => {
             let counts = DirectUploadRecordCounts {
                 frames: frames.len(),
+                parsed: parsed.len(),
                 audio: audio.len(),
                 ui: ui.len(),
                 snapshots: snapshots.len(),
@@ -678,6 +721,7 @@ pub async fn run_one_sync(
 
     Ok(SyncTickReport {
         frames: frames.len(),
+        parsed: parsed.len(),
         audio: audio.len(),
         ui: ui.len(),
         snapshots: snapshots.len(),
@@ -689,6 +733,7 @@ pub async fn run_one_sync(
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SyncTickReport {
     pub frames: usize,
+    pub parsed: usize,
     pub audio: usize,
     pub ui: usize,
     pub snapshots: usize,
@@ -1766,6 +1811,38 @@ mod tests {
         }
     }
 
+    fn parsed(id: i64, ts: &str, text: &str) -> ParsedRow {
+        ParsedRow {
+            frame_id: id,
+            timestamp: ts.to_string(),
+            app_name: "Slack".to_string(),
+            window_name: "Acme".to_string(),
+            browser_url: None,
+            text: text.to_string(),
+            run_id: 9,
+            parser_id: "slack.messages".to_string(),
+            parser_version: "1.0.0".to_string(),
+            schema_version: 1,
+            app_platform: "macos".to_string(),
+            app_id: Some("com.tinyspeck.slackmacgap".to_string()),
+            app_executable: None,
+            app_version: Some("4.40".to_string()),
+            parse_duration_us: 400,
+            text_bytes: text.len(),
+            items: vec![serde_json::json!({
+                "local_id": "message:1",
+                "kind": "message",
+                "body": text,
+                "actor": "Ada"
+            })],
+            actors: vec![serde_json::json!({
+                "local_id": "message:1",
+                "name": "Ada Lovelace",
+                "observed_name": "Ada"
+            })],
+        }
+    }
+
     // ─── truncate_on_char_boundary (UTF-8 safety) ───────────────────────
 
     #[test]
@@ -1995,6 +2072,7 @@ mod tests {
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:30:00Z".to_string()),
             last_memory_ts: Some("2026-05-07T09:15:00Z".to_string()),
+            last_parsed_ts: Some("2026-05-07T09:15:00Z".to_string()),
         };
         c.save(&p).unwrap();
         let loaded = Cursor::load(&p);
@@ -2012,6 +2090,7 @@ mod tests {
             last_audio_ts: None,
             last_ui_ts: None,
             last_memory_ts: None,
+            last_parsed_ts: None,
         }
         .save(&p)
         .unwrap();
@@ -2160,9 +2239,11 @@ mod tests {
         frames_to_yield: Mutex<Vec<Vec<FrameRow>>>,
         audio_to_yield: Mutex<Vec<Vec<AudioRow>>>,
         memories_to_yield: Mutex<Vec<Vec<MemoryRow>>>,
+        parsed_to_yield: Mutex<Vec<Vec<ParsedRow>>>,
         last_frames_since: Mutex<Option<String>>,
         last_audio_since: Mutex<Option<String>>,
         last_memories_since: Mutex<Option<String>>,
+        last_parsed_since: Mutex<Option<String>>,
     }
 
     impl MockLocal {
@@ -2171,14 +2252,21 @@ mod tests {
                 frames_to_yield: Mutex::new(frames),
                 audio_to_yield: Mutex::new(audio),
                 memories_to_yield: Mutex::new(Vec::new()),
+                parsed_to_yield: Mutex::new(Vec::new()),
                 last_frames_since: Mutex::new(None),
                 last_audio_since: Mutex::new(None),
                 last_memories_since: Mutex::new(None),
+                last_parsed_since: Mutex::new(None),
             }
         }
 
         fn with_memories(mut self, memories: Vec<Vec<MemoryRow>>) -> Self {
             self.memories_to_yield = Mutex::new(memories);
+            self
+        }
+
+        fn with_parsed(mut self, parsed: Vec<Vec<ParsedRow>>) -> Self {
+            self.parsed_to_yield = Mutex::new(parsed);
             self
         }
     }
@@ -2221,6 +2309,20 @@ mod tests {
             *self.last_memories_since.lock().unwrap() = since_ts.map(|s| s.to_string());
             Ok(self
                 .memories_to_yield
+                .lock()
+                .unwrap()
+                .pop()
+                .unwrap_or_default())
+        }
+
+        async fn fetch_parsed_since(
+            &self,
+            since_ts: Option<&str>,
+            _limit: u32,
+        ) -> Result<Vec<ParsedRow>, EnterpriseSyncError> {
+            *self.last_parsed_since.lock().unwrap() = since_ts.map(|s| s.to_string());
+            Ok(self
+                .parsed_to_yield
                 .lock()
                 .unwrap()
                 .pop()
@@ -2315,6 +2417,7 @@ mod tests {
             last_audio_ts: Some("2026-05-07T10:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T10:00:00Z".to_string()),
             last_memory_ts: Some("2026-05-07T10:00:00Z".to_string()),
+            last_parsed_ts: Some("2026-05-07T10:00:00Z".to_string()),
         };
         let local = MockLocal::new(vec![vec![]], vec![vec![]]);
         let http = reqwest::Client::new();
@@ -2368,6 +2471,7 @@ mod tests {
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_memory_ts: None,
+            last_parsed_ts: None,
         };
         let local = MockLocal::new(
             vec![vec![
@@ -2412,6 +2516,7 @@ mod tests {
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_memory_ts: None,
+            last_parsed_ts: None,
         };
         let mut cursor = original_cursor.clone();
         let large_text = "x".repeat(2 * 1024 * 1024);
@@ -2472,6 +2577,7 @@ mod tests {
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_memory_ts: None,
+            last_parsed_ts: None,
         };
         let before = cursor.clone();
         let large_text = "x".repeat(2 * 1024 * 1024);
@@ -2514,6 +2620,7 @@ mod tests {
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_memory_ts: Some("2026-05-07T09:00:00Z".to_string()),
+            last_parsed_ts: Some("2026-05-07T09:00:00Z".to_string()),
         };
         let local = MockLocal::new(vec![vec![]], vec![vec![]]).with_memories(vec![vec![
             memory(1, "2026-05-07T10:00:00Z", "first"),
@@ -2538,6 +2645,81 @@ mod tests {
         );
         let loaded = Cursor::load(&cfg.cursor_path);
         assert_eq!(loaded.last_memory_ts, cursor.last_memory_ts);
+    }
+
+    #[tokio::test]
+    async fn parsed_rows_upload_as_a_separate_gated_stream_end_to_end() {
+        let _guard = crate::enterprise_policy::sync_streams_test_lock();
+        crate::enterprise_policy::set_sync_streams(
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            "off".to_string(),
+        );
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/ingest"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = TempDir::new().unwrap();
+        let cfg = test_cfg(&dir, format!("{}/ingest", server.uri()));
+        let mut cursor = Cursor {
+            last_frame_ts: Some("2026-05-07T09:00:00Z".to_string()),
+            last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
+            last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
+            last_memory_ts: Some("2026-05-07T09:00:00Z".to_string()),
+            last_parsed_ts: Some("2026-05-07T09:00:00Z".to_string()),
+        };
+        let local = MockLocal::new(vec![], vec![]).with_parsed(vec![vec![parsed(
+            42,
+            "2026-05-07T10:00:00Z",
+            "Ada Lovelace: ship Acme",
+        )]]);
+
+        let report = run_one_sync(&cfg, &mut cursor, &local, &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(report.parsed, 1);
+        assert_eq!(
+            cursor.last_parsed_ts.as_deref(),
+            Some("2026-05-07T10:00:00Z")
+        );
+        assert_eq!(
+            local.last_parsed_since.lock().unwrap().as_deref(),
+            Some("2026-05-07T09:00:00Z")
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        let body = &requests[0].body;
+        let batch = screenpipe_telemetry_wire::parse_jsonl(body);
+        assert_eq!(batch.skipped_lines, 0);
+        assert_eq!(batch.records.len(), 1);
+        match &batch.records[0] {
+            TelemetryRecord::Parsed { parsed, .. } => {
+                assert_eq!(parsed.frame_id, 42);
+                assert_eq!(parsed.parser_id, "slack.messages");
+                assert_eq!(parsed.items[0]["kind"], "message");
+                assert_eq!(parsed.actors[0]["name"], "Ada Lovelace");
+            }
+            other => panic!("expected parsed row, got {}", other.kind()),
+        }
+
+        crate::enterprise_policy::set_sync_streams(
+            true,
+            false,
+            true,
+            true,
+            true,
+            true,
+            "off".to_string(),
+        );
     }
 
     #[tokio::test]
@@ -2592,6 +2774,7 @@ mod tests {
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_memory_ts: None,
+            last_parsed_ts: None,
         };
         let local = MockLocal::new(
             vec![vec![frame(1, "2026-05-07T10:00:00Z", "Arc", "secret")]],
@@ -2663,6 +2846,7 @@ mod tests {
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_memory_ts: None,
+            last_parsed_ts: None,
         };
         let local = MockLocal::new(
             vec![vec![frame(
@@ -2725,6 +2909,7 @@ mod tests {
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_memory_ts: None,
+            last_parsed_ts: None,
         };
         let local = MockLocal::new(
             vec![vec![frame(1, "2026-05-07T10:00:00Z", "Arc", "secret")]],
@@ -2758,6 +2943,7 @@ mod tests {
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_memory_ts: None,
+            last_parsed_ts: None,
         };
         let local = MockLocal::new(
             vec![vec![frame(1, "2026-05-07T10:00:00Z", "Arc", "x")]],
@@ -2790,6 +2976,7 @@ mod tests {
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_memory_ts: None,
+            last_parsed_ts: None,
         };
         let local = MockLocal::new(
             vec![vec![frame(1, "2026-05-07T10:00:00Z", "Arc", "x")]],
@@ -2828,6 +3015,7 @@ mod tests {
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_memory_ts: None,
+            last_parsed_ts: None,
         };
         let local = MockLocal::new(
             vec![vec![frame(1, "2026-05-07T10:00:00Z", "Arc", "x")]],
@@ -2938,6 +3126,7 @@ mod tests {
         // Disable frames, ui, snapshots. Keep audio + memories on.
         crate::enterprise_policy::set_sync_streams(
             false,
+            false,
             true,
             false,
             true,
@@ -2968,6 +3157,7 @@ mod tests {
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_memory_ts: Some("2026-05-07T09:00:00Z".to_string()),
+            last_parsed_ts: Some("2026-05-07T09:00:00Z".to_string()),
         };
         let local = CallCountingLocal::new();
         let http = reqwest::Client::new();
@@ -3030,7 +3220,15 @@ mod tests {
 
         // Reset to defaults so the binary-wide static doesn't leak into
         // other tests that may run later in the same process.
-        crate::enterprise_policy::set_sync_streams(true, true, true, true, true, "off".to_string());
+        crate::enterprise_policy::set_sync_streams(
+            true,
+            false,
+            true,
+            true,
+            true,
+            true,
+            "off".to_string(),
+        );
     }
 
     // ─── On-demand frame fulfillment (P3) ───────────────────────────────────
@@ -3189,6 +3387,7 @@ mod tests {
         let _guard = crate::enterprise_policy::sync_streams_test_lock();
         crate::enterprise_policy::set_sync_streams(
             true,
+            false,
             true,
             true,
             true,
@@ -3255,13 +3454,29 @@ mod tests {
         assert_eq!(frames[1]["error"], "not_found");
         assert_eq!(frames[2]["error"], "fetch_failed");
 
-        crate::enterprise_policy::set_sync_streams(true, true, true, true, true, "off".to_string());
+        crate::enterprise_policy::set_sync_streams(
+            true,
+            false,
+            true,
+            true,
+            true,
+            true,
+            "off".to_string(),
+        );
     }
 
     #[tokio::test]
     async fn fulfill_frame_requests_splits_large_manifest_without_dropping_ids() {
         let _guard = crate::enterprise_policy::sync_streams_test_lock();
-        crate::enterprise_policy::set_sync_streams(true, true, true, true, true, "all".to_string());
+        crate::enterprise_policy::set_sync_streams(
+            true,
+            false,
+            true,
+            true,
+            true,
+            true,
+            "all".to_string(),
+        );
 
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -3309,14 +3524,30 @@ mod tests {
         }
         assert_eq!(uploaded_ids, (1..=21).collect::<Vec<_>>());
 
-        crate::enterprise_policy::set_sync_streams(true, true, true, true, true, "off".to_string());
+        crate::enterprise_policy::set_sync_streams(
+            true,
+            false,
+            true,
+            true,
+            true,
+            true,
+            "off".to_string(),
+        );
     }
 
     #[tokio::test]
     async fn fulfill_skips_when_stream_disabled() {
         let _guard = crate::enterprise_policy::sync_streams_test_lock();
         // frame_images=false is the default; set explicitly for clarity.
-        crate::enterprise_policy::set_sync_streams(true, true, true, true, true, "off".to_string());
+        crate::enterprise_policy::set_sync_streams(
+            true,
+            false,
+            true,
+            true,
+            true,
+            true,
+            "off".to_string(),
+        );
 
         let server = wiremock::MockServer::start().await;
         // Zero expected requests — the policy gate short-circuits before HTTP.
@@ -3338,6 +3569,7 @@ mod tests {
         let _guard = crate::enterprise_policy::sync_streams_test_lock();
         crate::enterprise_policy::set_sync_streams(
             true,
+            false,
             true,
             true,
             true,
@@ -3365,7 +3597,15 @@ mod tests {
         let report = fulfill_frame_requests(&cfg, &FrameMock, &http).await;
         assert_eq!(report, FrameFulfillReport::default());
 
-        crate::enterprise_policy::set_sync_streams(true, true, true, true, true, "off".to_string());
+        crate::enterprise_policy::set_sync_streams(
+            true,
+            false,
+            true,
+            true,
+            true,
+            true,
+            "off".to_string(),
+        );
     }
 }
 // (frame_batch_max tests live with the rest of the ee_sync tests above; this

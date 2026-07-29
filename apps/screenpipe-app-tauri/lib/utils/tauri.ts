@@ -2255,11 +2255,11 @@ async setSyncEnabled(enabled: boolean) : Promise<Result<null, string>> {
  * Called by the frontend after fetching the `syncStreams` block from
  * `/api/enterprise/policy`. Flat params rather than a struct so the
  * specta-generated TS binding stays trivial. `frame_images` is the mode
- * string ("off" | "cited" | "all"; legacy "true" accepted) — parsed
- * fail-closed by FrameImagesMode::parse.
+ * string ("off" | "cited" | "all"; legacy "true" accepted) and invalid
+ * values fail closed in FrameImagesMode::parse.
  */
-async setSyncStreams(frames: boolean, audio: boolean, uiEvents: boolean, memories: boolean, snapshots: boolean, frameImages: string) : Promise<void> {
-    await TAURI_INVOKE("set_sync_streams", { frames, audio, uiEvents, memories, snapshots, frameImages });
+async setSyncStreams(frames: boolean, parsed: boolean, audio: boolean, uiEvents: boolean, memories: boolean, snapshots: boolean, frameImages: string) : Promise<void> {
+    await TAURI_INVOKE("set_sync_streams", { frames, parsed, audio, uiEvents, memories, snapshots, frameImages });
 },
 async setTrayHealthIcon() : Promise<void> {
     await TAURI_INVOKE("set_tray_health_icon");
@@ -2926,6 +2926,16 @@ endTime: string;
  */
 recordMode: string }
 export type SchedulerStatus = { running: boolean; last_sync: string | null; last_error: string | null }
+/**
+ * Which AI projection to build from the existing screen/accessibility stream.
+ *
+ * `Memory` preserves the original semantic-parser behavior. `ComputerUse` is
+ * shown to users as automation: it keeps capture action-oriented and skips the
+ * semantic parser worker. `Both` is shown as memory + automation and derives
+ * both views from the same captured tree; it never starts a second screen
+ * recorder or stores a duplicate raw accessibility tree.
+ */
+export type SemanticContextMode = "memory" | "computerUse" | "both"
 export type SettingsStore =
 /**
  * All recording/capture config lives here. Flattened so the JSON shape
@@ -3075,14 +3085,17 @@ disableVision: boolean;
  */
 disableScreenshots?: boolean;
 /**
- * Enable experimental normalized semantic context parsing. Off by default.
+ * Build normalized semantic context from captured accessibility trees.
+ * Experimental and opt-in. False preserves the historical capture path
+ * without starting a parser worker or writing semantic tables.
  */
 enableSemanticContext?: boolean;
 /**
- * AI projection derived from the shared accessibility capture. `computerUse`
- * skips semantic parser storage; `both` reuses the same captured tree.
+ * Select the AI view derived from the single captured accessibility tree.
+ * Missing values default to memory so existing opt-in users retain the
+ * exact behavior they selected before this setting existed.
  */
-semanticContextMode?: "memory" | "computerUse" | "both";
+semanticContextMode?: SemanticContextMode;
 /**
  * Disable the timeline / rewind feature. When true, the engine skips
  * timeline-only work: warming the hot frame cache from the DB at startup
