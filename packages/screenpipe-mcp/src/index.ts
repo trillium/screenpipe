@@ -943,7 +943,7 @@ const TEAM_TOOLS: Tool[] = [
     name: "team-records",
     description:
       "Chronological dump of the org's data for a time window — both raw " +
-      "telemetry (frame/audio) and the structured outputs of the enterprise-" +
+      "telemetry (frame/parsed/audio) and the structured outputs of the enterprise-" +
       "worker pipes (sop/skill/trajectory/memory/workflow). " +
       "Raw kinds return oldest → newest (vs team-search which is recency-ranked). " +
       "Synthesized kinds return one record per device's latest run by default " +
@@ -960,9 +960,9 @@ const TEAM_TOOLS: Tool[] = [
         device_id: { type: "string", description: "Restrict to one device (optional). Raw kinds only." },
         kind: {
           type: "string",
-          enum: ["frame", "audio", "all", "sop", "skill", "trajectory", "memory", "workflow"],
+          enum: ["frame", "parsed", "audio", "all", "sop", "skill", "trajectory", "memory", "workflow"],
           description:
-            "What to return. Raw: frame|audio|all (telemetry). " +
+            "What to return. Raw: frame|parsed|audio|all (telemetry). " +
             "Synthesized: sop|skill|trajectory|memory|workflow (pipe outputs). " +
             "Default: all.",
           default: "all",
