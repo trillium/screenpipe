@@ -93,6 +93,12 @@
       "layers": ["chat-ai"]
     },
     {
+      "id": "chat-coding-worktrees",
+      "label": "Conversation-owned coding worktrees",
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["chat-ai", "tauri-command", "real-ui-e2e"]
+    },
+    {
       "id": "tray-search",
       "label": "Tray/search window behavior",
       "platforms": ["windows", "macos", "linux"],
@@ -203,6 +209,26 @@
       "confidence": "partial",
       "ux": "mixed",
       "notes": "Composer draft isolation across conversations."
+    },
+    {
+      "spec": "chat-coding-worktree.spec.ts",
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["chat-ai", "tauri-command", "real-ui-e2e"],
+      "features": ["chat", "chat-coding-worktrees"],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "Creates a worktree from a dirty Git source through the real Chat control, proves source preservation, conversation isolation and resume, launches Pi in the owned cwd while ignoring a hostile project-local extension, and verifies work survives Pi stop."
+    },
+    {
+      "spec": "chat-empty-space.spec.ts",
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["chat-ai", "real-ui-e2e"],
+      "features": ["chat"],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "Keeps a compact assistant answer near the composer without an empty viewport gap or false new-content state."
     },
     {
       "spec": "chat-ask-user-tool-card.spec.ts",
