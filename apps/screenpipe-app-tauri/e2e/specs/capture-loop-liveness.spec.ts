@@ -20,10 +20,13 @@
  */
 
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
 
-import { E2E_SEED_FLAGS, getAppPid } from "../helpers/app-launcher.js";
+import {
+  E2E_DATA_DIR,
+  E2E_SEED_FLAGS,
+  getAppPid,
+} from "../helpers/app-launcher.js";
 import {
   authHeaders,
   fetchJson,
@@ -34,9 +37,7 @@ import { t, waitForAppReady } from "../helpers/test-utils.js";
 // Written by the engine the moment the injected probe hang fires — proves
 // the fault was actually exercised (see e2e_take_visual_check_hang).
 const HANG_MARKER = resolve(
-  homedir(),
-  ".screenpipe",
-  ".e2e",
+  E2E_DATA_DIR,
   "e2e-visual-check-hang-fired",
 );
 

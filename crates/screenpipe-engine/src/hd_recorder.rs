@@ -22,8 +22,9 @@
 //! So we split the work:
 //! - an **encoder task** drains the SCK stream and JPEG-encodes the newest frame
 //!   on a blocking thread, publishing the latest encoded frame;
-//! - a **writer timer** emits exactly one frame per `1/fps` tick — the latest
-//!   encoded frame, repeating the previous one when nothing newer arrived.
+//! - a **writer timer** targets `elapsed_wall_time * fps` frames — the latest
+//!   encoded frame, repeating the previous one when nothing newer arrived and
+//!   catching up after executor or ffmpeg backpressure delays.
 //!
 //! The writer's rate is therefore independent of both the capture-change rate
 //! and the encode cost, so the chunk is true CFR: smooth playback, and
@@ -118,6 +119,8 @@ mod macos {
     use super::*;
     use std::path::Path;
     use std::process::Stdio;
+    #[cfg(debug_assertions)]
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -135,12 +138,57 @@ mod macos {
     /// points, so a coarse cadence keeps the frames table bounded on long runs.
     const HD_INDEX_EVERY_SECS: f64 = 1.0;
 
+    /// Debug-only fault injection used by the HD duration e2e regression. It
+    /// stalls the writer once, after a real frame is available, so the test can
+    /// prove that executor delays do not shorten the finalized CFR artifact.
+    #[cfg(debug_assertions)]
+    static E2E_HD_WRITER_STALL_FIRED: AtomicBool = AtomicBool::new(false);
+
+    #[cfg(any(debug_assertions, test))]
+    fn seed_list_has_hd_writer_stall(seeds: &str) -> bool {
+        seeds
+            .split(',')
+            .any(|seed| seed.trim() == "hd-writer-stall-once")
+    }
+
+    #[cfg(debug_assertions)]
+    async fn e2e_stall_hd_writer_once() {
+        let armed = std::env::var("SCREENPIPE_E2E_SEED")
+            .ok()
+            .is_some_and(|seeds| seed_list_has_hd_writer_stall(&seeds));
+        if !armed || E2E_HD_WRITER_STALL_FIRED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        warn!("e2e: injecting one 3s HD writer stall (hd-writer-stall-once)");
+        if let Ok(dir) = std::env::var("SCREENPIPE_DATA_DIR") {
+            let _ = std::fs::write(
+                std::path::Path::new(&dir).join("e2e-hd-writer-stall-fired"),
+                b"1",
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
     /// Convert a capture interval (ms) to an integer fps in [1, 60].
     fn interval_to_fps(interval_ms: u64) -> u32 {
         if interval_ms == 0 {
             return 10;
         }
         ((1000 / interval_ms.max(1)) as u32).clamp(1, 60)
+    }
+
+    /// Number of CFR frames that should exist after `elapsed` wall time.
+    ///
+    /// The writer task can be delayed by runtime scheduling, JPEG work, or
+    /// ffmpeg backpressure. Counting timer wakeups therefore shortens the mp4;
+    /// deriving the target from monotonic elapsed time lets the writer repeat
+    /// the latest safe frame until the artifact catches up. Cap at one chunk so
+    /// a stalled task can never enqueue more than the configured rotation size.
+    fn target_frame_count(elapsed: Duration, fps: u32) -> i64 {
+        let capped = elapsed.min(Duration::from_secs(HD_CHUNK_MAX_SECS));
+        let frames = capped.as_nanos().saturating_mul(fps.max(1) as u128) / 1_000_000_000u128;
+        frames.min(i64::MAX as u128) as i64
     }
 
     /// True when capture must not run: screen locked, DRM content on screen, or
@@ -292,9 +340,10 @@ mod macos {
             }
         });
 
-        // Writer: emit exactly one frame per `1/fps` tick — the latest encoded
-        // frame, or a repeat of the previous one when nothing newer arrived. This
-        // is what makes the chunk true CFR regardless of capture/encode speed.
+        // Writer: keep the CFR frame count aligned to monotonic wall time. The
+        // ticker is only a wakeup; missed wakeups must be recovered by repeating
+        // the latest encoded frame, otherwise runtime/ffmpeg delays shorten the
+        // finalized mp4 even though the recording session stayed active.
         let tick = Duration::from_millis((1000 / actual_fps as u64).max(1));
         let mut ticker = tokio::time::interval(tick);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -304,13 +353,12 @@ mod macos {
         let started = Instant::now();
         let mut write_failed = false;
 
-        loop {
+        'writer: loop {
             ticker.tick().await;
-            if stop_signal.load(Ordering::Relaxed)
+            let stop_requested = stop_signal.load(Ordering::Relaxed)
                 || !controller.snapshot().active
-                || capture_blocked()
-                || started.elapsed().as_secs() >= HD_CHUNK_MAX_SECS
-            {
+                || started.elapsed() >= Duration::from_secs(HD_CHUNK_MAX_SECS);
+            if capture_blocked() {
                 break;
             }
 
@@ -318,31 +366,64 @@ mod macos {
             // has been captured + encoded — skip those early ticks.
             let jpeg = latest.lock().ok().and_then(|g| g.clone());
             let Some(jpeg) = jpeg else {
+                if stop_requested {
+                    break;
+                }
                 continue;
             };
 
-            if let Err(e) = stdin.write_all(&jpeg[..]).await {
-                warn!("hd recorder: ffmpeg stdin write failed on monitor {monitor_id}: {e}");
-                write_failed = true;
+            #[cfg(debug_assertions)]
+            e2e_stall_hd_writer_once().await;
+
+            // The injected/debug stall and normal async backpressure both count
+            // toward the session. Re-sample after them before deriving the CFR
+            // target, and re-check the privacy gates before repeating a frame.
+            let elapsed = started.elapsed();
+            let stop_requested = stop_signal.load(Ordering::Relaxed)
+                || !controller.snapshot().active
+                || elapsed >= Duration::from_secs(HD_CHUNK_MAX_SECS);
+            if capture_blocked() {
                 break;
             }
+            let target_frames = target_frame_count(elapsed, actual_fps);
 
-            // Sparse scrub marker into the timeline (image-only — no OCR). The
-            // .mp4 holds every frame for smooth playback; markers are scrub points.
-            if frame_idx >= next_index_frame {
-                next_index_frame = frame_idx + index_stride;
-                let ts = chunk_start
-                    + chrono::Duration::milliseconds(
-                        (frame_idx as f64 / actual_fps as f64 * 1000.0) as i64,
-                    );
-                if let Err(e) = db
-                    .insert_hd_index_frame(chunk_id, frame_idx, ts, device_name)
-                    .await
-                {
-                    debug!("hd recorder: index frame insert failed: {e}");
+            while frame_idx < target_frames {
+                if let Err(e) = stdin.write_all(&jpeg[..]).await {
+                    warn!("hd recorder: ffmpeg stdin write failed on monitor {monitor_id}: {e}");
+                    write_failed = true;
+                    break 'writer;
+                }
+
+                // Sparse scrub marker into the timeline (image-only — no OCR).
+                // The .mp4 holds every frame; markers are only scrub points.
+                if frame_idx >= next_index_frame {
+                    next_index_frame = frame_idx + index_stride;
+                    let ts = chunk_start
+                        + chrono::Duration::milliseconds(
+                            (frame_idx as f64 / actual_fps as f64 * 1000.0) as i64,
+                        );
+                    if let Err(e) = db
+                        .insert_hd_index_frame(chunk_id, frame_idx, ts, device_name)
+                        .await
+                    {
+                        debug!("hd recorder: index frame insert failed: {e}");
+                    }
+                }
+                frame_idx += 1;
+
+                // A long scheduler pause can make many frames due at once. Yield
+                // once per recovered second so capture and shutdown stay responsive.
+                if frame_idx % actual_fps as i64 == 0 {
+                    tokio::task::yield_now().await;
+                    if capture_blocked() {
+                        break 'writer;
+                    }
                 }
             }
-            frame_idx += 1;
+
+            if stop_requested {
+                break;
+            }
         }
 
         // Finalize: stop the encoder, flush + close stdin so ffmpeg writes the
@@ -474,6 +555,28 @@ mod macos {
             assert_eq!(interval_to_fps(0), 10); // guard
             assert_eq!(interval_to_fps(1000), 1); // 1fps
             assert_eq!(interval_to_fps(5), 60); // clamped to 60
+        }
+
+        #[test]
+        fn target_frame_count_tracks_wall_time_and_caps_at_chunk_length() {
+            assert_eq!(target_frame_count(Duration::ZERO, 10), 0);
+            assert_eq!(target_frame_count(Duration::from_millis(99), 10), 0);
+            assert_eq!(target_frame_count(Duration::from_millis(100), 10), 1);
+            assert_eq!(target_frame_count(Duration::from_millis(4_300), 10), 43);
+            assert_eq!(target_frame_count(Duration::from_secs(400), 10), 3_000);
+        }
+
+        #[test]
+        fn hd_writer_stall_seed_parses_only_the_exact_token() {
+            assert!(seed_list_has_hd_writer_stall("hd-writer-stall-once"));
+            assert!(seed_list_has_hd_writer_stall(
+                "onboarding,no-audio, hd-writer-stall-once "
+            ));
+            assert!(!seed_list_has_hd_writer_stall("hd-writer-stall"));
+            assert!(!seed_list_has_hd_writer_stall(
+                "prefix-hd-writer-stall-once-suffix"
+            ));
+            assert!(!seed_list_has_hd_writer_stall(""));
         }
 
         fn jpeg_dims(bytes: &[u8]) -> (u32, u32) {
